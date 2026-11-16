@@ -15,6 +15,7 @@ import csv
 import json
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from pathlib import Path
 VENTANA = 10          # segundos por ventana de análisis
 SEPARACION_MIN = 30   # dos picos a menos de esto se consideran el mismo momento
 ANTICIPO = 20         # el clip empieza estos segundos antes del pico
+CONTEXTO = 300        # el nivel "normal" del chat se mide en los +-5 min de alrededor
 
 # Risas en texto: jaja, jajaja, jeje, haha, lol, lmao, xd... (sin distinguir mayúsculas)
 RISA_TEXTO = re.compile(
@@ -104,7 +106,7 @@ def descargar_chat(td, vod, destino):
 
 
 def cargar_mensajes(ruta_json):
-    """Devuelve una lista de (segundo_del_directo, texto)."""
+    """Devuelve (lista de (segundo_del_directo, texto), duración del directo en s)."""
     try:
         datos = json.loads(ruta_json.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as e:
@@ -119,7 +121,12 @@ def cargar_mensajes(ruta_json):
         raise ErrorClips(
             "Este VOD no tiene chat (0 mensajes). Sin chat no hay picos que detectar.\n"
             "Pasa con VODs muy antiguos, subidas/highlights sin chat o chat desactivado.")
-    return mensajes
+    fin = max(t for t, _ in mensajes)
+    try:
+        fin = max(fin, float((datos.get("video") or {}).get("end") or 0))
+    except (TypeError, ValueError):
+        pass
+    return mensajes, fin
 
 
 # ---------------------------------------------------------------- 2-5. análisis
@@ -128,22 +135,37 @@ def es_risa(texto):
     return bool(RISA_TEXTO.search(texto)) or any(p in EMOTES_RISA for p in texto.split())
 
 
-def detectar_picos(mensajes, max_clips):
-    """Ventanas de 10 s, risas x2, top N sin solapes. Devuelve lista de dicts."""
-    n_mensajes, score = {}, {}
+def detectar_picos(mensajes, max_clips, desde=0, hasta=float("inf")):
+    """Ventanas de 10 s, risas x2. Lo que cuenta no es cuánto se escribe sino cuánto
+    se dispara el chat sobre su nivel normal de esos minutos (mediana de +-5 min):
+    así los saludos del principio y las despedidas del final, donde el chat va rápido
+    todo el rato, no pasan por momentazos. Solo se aceptan picos entre desde y hasta.
+    """
+    n_ventanas = int(max(t for t, _ in mensajes) // VENTANA) + 1
+    n_mensajes, score = [0] * n_ventanas, [0] * n_ventanas
     for t, texto in mensajes:
         v = int(t // VENTANA)
-        n_mensajes[v] = n_mensajes.get(v, 0) + 1
-        score[v] = score.get(v, 0) + (2 if es_risa(texto) else 1)
+        n_mensajes[v] += 1
+        score[v] += 2 if es_risa(texto) else 1
+
+    radio = CONTEXTO // VENTANA
+    exceso = {}
+    for v in range(n_ventanas):
+        if score[v] == 0 or not (desde <= v * VENTANA < hasta):
+            continue
+        base = statistics.median(score[max(0, v - radio):v + radio + 1])
+        if score[v] > base:
+            exceso[v] = (score[v] - base, base)
 
     picos = []
-    # De mayor a menor score; a igualdad, gana el que ocurre antes.
-    for v in sorted(score, key=lambda v: (-score[v], v)):
+    # De mayor a menor exceso; a igualdad, gana el que ocurre antes.
+    for v in sorted(exceso, key=lambda v: (-exceso[v][0], v)):
         pico = v * VENTANA
         if any(abs(pico - p["pico"]) < SEPARACION_MIN for p in picos):
             continue  # solapa con un pico mayor ya elegido
         picos.append({"pico": pico, "inicio": max(0, pico - ANTICIPO),
-                      "mensajes": n_mensajes[v], "score": score[v]})
+                      "mensajes": n_mensajes[v], "score": score[v],
+                      "normal": round(exceso[v][1]), "exceso": round(exceso[v][0])})
         if len(picos) == max_clips:
             break
     return picos
@@ -216,6 +238,8 @@ def main():
     ap.add_argument("--salida", default="./clips", help="carpeta de salida (por defecto ./clips)")
     ap.add_argument("--max_clips", type=int, default=10, help="número máximo de clips (por defecto 10)")
     ap.add_argument("--duracion", type=int, default=40, help="duración de cada clip en segundos (por defecto 40)")
+    ap.add_argument("--saltar_inicio", type=float, default=5, help="minutos del principio del directo que se ignoran (por defecto 5)")
+    ap.add_argument("--saltar_fin", type=float, default=5, help="minutos del final del directo que se ignoran (por defecto 5)")
     ap.add_argument("--subtitulos", action="store_true", help="quemar subtítulos generados con Whisper")
     ap.add_argument("--modelo_whisper", default="small", help="modelo de Whisper: tiny, base, small, medium... (por defecto small)")
     ap.add_argument("--idioma", default=None, help="idioma del audio para Whisper, p. ej. es o en (por defecto: autodetectar)")
@@ -228,6 +252,8 @@ def main():
 
     if args.max_clips < 1 or args.duracion < 1:
         raise ErrorClips("--max_clips y --duracion deben ser mayores que 0.")
+    if args.saltar_inicio < 0 or args.saltar_fin < 0:
+        raise ErrorClips("--saltar_inicio y --saltar_fin no pueden ser negativos.")
     if args.video and not Path(args.video).is_file():
         raise ErrorClips(f"No existe el vídeo local: {args.video}")
     if args.chat and not Path(args.chat).is_file():
@@ -254,20 +280,24 @@ def main():
     salida.mkdir(parents=True, exist_ok=True)
     descargar_chat(td, args.vod, chat_json)
 
-    mensajes = cargar_mensajes(chat_json)
+    mensajes, fin = cargar_mensajes(chat_json)
     print(f"[2/4] {len(mensajes)} mensajes analizados en ventanas de {VENTANA} s")
-    picos = detectar_picos(mensajes, args.max_clips)
+    desde, hasta = args.saltar_inicio * 60, fin - args.saltar_fin * 60
+    if desde >= hasta:
+        raise ErrorClips(f"El directo dura {hms(fin)}: con --saltar_inicio y --saltar_fin no queda nada que analizar.")
+    print(f"      Directo de {hms(fin)}; busco picos entre {hms(desde)} y {hms(hasta)}")
+    picos = detectar_picos(mensajes, args.max_clips, desde, hasta)
     print(f"[3/4] {len(picos)} picos detectados:")
     for i, p in enumerate(picos, 1):
         p["nombre"] = f"{i:02d}_pico_{hms(p['pico'], '-')}.mp4"
         print(f"      {i:02d}. pico {hms(p['pico'])}  clip desde {hms(p['inicio'])}  "
-              f"{p['mensajes']} msgs  score {p['score']}")
+              f"{p['mensajes']} msgs  score {p['score']} (normal {p['normal']}, +{p['exceso']})")
 
     with open(salida / "resumen.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["clip", "timestamp_pico", "timestamp_inicio", "mensajes", "score"])
+        w.writerow(["clip", "timestamp_pico", "timestamp_inicio", "mensajes", "score", "normal", "exceso"])
         for p in picos:
-            w.writerow([p["nombre"], hms(p["pico"]), hms(p["inicio"]), p["mensajes"], p["score"]])
+            w.writerow([p["nombre"], hms(p["pico"]), hms(p["inicio"]), p["mensajes"], p["score"], p["normal"], p["exceso"]])
 
     if not cortar:
         print(f"[4/4] Solo análisis: resumen en {salida / 'resumen.csv'}")

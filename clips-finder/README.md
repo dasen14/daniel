@@ -11,10 +11,11 @@ Pensado para directos largos (p. ej. 6 horas de GTA 6) que no quieres ver entero
 1. Descarga el chat completo del VOD con TwitchDownloaderCLI (`chat.json`).
 2. Cuenta los mensajes en ventanas de 10 segundos.
 3. Los mensajes con risas (`jajaja`, `jeje`, `lol`, `lmao`, `XD`, `KEKW`, `LUL`, `OMEGALUL`, 😂...) cuentan **x2**.
-4. Ordena las ventanas por score y se queda con las más altas. Si dos picos están a menos de 30 s, solo sobrevive el mayor.
-5. **Regla de los 20 segundos:** el chat reacciona tarde, así que el clip empieza 20 s antes del pico (pico en `01:12:30` → clip desde `01:12:10`).
-6. Descarga solo el trozo de vídeo de cada clip (no el VOD entero) y lo recorta con ffmpeg a 9:16, 1080x1920.
-7. Escribe los clips ordenados por intensidad y un `resumen.csv`.
+4. Compara cada ventana con el nivel **normal** del chat en ese tramo (la mediana de los ±5 minutos de alrededor) y se queda con las que más se disparan por encima. Así un chat que va rápido todo el rato (saludos al empezar, despedida al acabar) no cuenta como momentazo; solo cuentan las explosiones. Si dos picos están a menos de 30 s, solo sobrevive el mayor.
+5. Ignora los primeros y los últimos 5 minutos del directo (`--saltar_inicio`, `--saltar_fin`).
+6. **Regla de los 20 segundos:** el chat reacciona tarde, así que el clip empieza 20 s antes del pico (pico en `01:12:30` → clip desde `01:12:10`).
+7. Descarga solo el trozo de vídeo de cada clip (no el VOD entero) y lo recorta con ffmpeg a 9:16, 1080x1920.
+8. Escribe los clips ordenados por intensidad y un `resumen.csv`.
 
 No necesita API keys de Twitch ni cuenta.
 
@@ -63,6 +64,8 @@ python main.py --vod <URL_O_ID_DEL_VOD> --salida ./clips --max_clips 10
 | `--salida` | `./clips` | Carpeta de salida |
 | `--max_clips` | `10` | Número máximo de clips |
 | `--duracion` | `40` | Duración de cada clip en segundos |
+| `--saltar_inicio` | `5` | Minutos del principio del directo que se ignoran |
+| `--saltar_fin` | `5` | Minutos del final del directo que se ignoran |
 | `--subtitulos` | desactivado | Quema subtítulos generados con Whisper a partir del audio |
 | `--modelo_whisper` | `small` | Modelo de Whisper (`tiny`, `base`, `small`, `medium`, `large`) |
 | `--idioma` | autodetectar | Idioma del audio para Whisper (`es`, `en`...) |
@@ -87,8 +90,8 @@ Salida por pantalla:
 [1/4] Descargando chat del VOD (puede tardar varios minutos)...
 [2/4] 184213 mensajes analizados en ventanas de 10 s
 [3/4] 10 picos detectados:
-      01. pico 01:12:30  clip desde 01:12:10  412 msgs  score 655
-      02. pico 00:45:10  clip desde 00:44:50  380 msgs  score 590
+      01. pico 01:12:30  clip desde 01:12:10  412 msgs  score 655 (normal 90, +565)
+      02. pico 00:45:10  clip desde 00:44:50  380 msgs  score 590 (normal 120, +470)
       ...
 [4/4] Cortando clip 1/10: 01_pico_01-12-30.mp4
 ...
@@ -110,9 +113,9 @@ clips/
 `resumen.csv`:
 
 ```csv
-clip,timestamp_pico,timestamp_inicio,mensajes,score
-01_pico_01-12-30.mp4,01:12:30,01:12:10,412,655
-02_pico_00-45-10.mp4,00:45:10,00:44:50,380,590
+clip,timestamp_pico,timestamp_inicio,mensajes,score,normal,exceso
+01_pico_01-12-30.mp4,01:12:30,01:12:10,412,655,90,565
+02_pico_00-45-10.mp4,00:45:10,00:44:50,380,590,120,470
 ```
 
 (Las cifras del ejemplo son ilustrativas.)
