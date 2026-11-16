@@ -1,0 +1,3 @@
+# El núcleo de clips-finder solo usa la librería estándar de Python.
+# Whisper solo hace falta si vas a usar --subtitulos (instala PyTorch, pesa bastante).
+openai-whisper
